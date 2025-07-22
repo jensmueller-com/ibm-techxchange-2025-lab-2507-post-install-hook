@@ -1,0 +1,391 @@
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Create Namespace resource (name: datastax)"
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: datastax
+        state: present
+
+    - name: "Get operator groups"
+      kubernetes.core.k8s_info:
+        kind: OperatorGroup
+        namespace: datastax
+      register: k8s_info_result
+
+    - name: "Create OperatorGroup resource (name prefix: datastax-)"
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            generateName: datastax-
+            namespace: datastax
+          spec:
+            targetNamespaces:
+              - datastax
+        state: present
+      when: k8s_info_result | json_query('resources[?!(spec.targetNamespaces.contains(@, ''datastax''))]') | length == 0
+
+    - name: "Create Subscription resource (name: cass-operator-community)"
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: cass-operator-community
+            namespace: datastax
+          spec:
+            channel: stable
+            installPlanApproval: Automatic
+            name: cass-operator-community
+            source: community-operators
+            sourceNamespace: openshift-marketplace
+        state: present
+
+    - name: "Waiting for creation of custom resource definitions"
+      wait_for_custom_resource_definitions:
+        custom_resource_definitions:
+          - "CassandraDatacenter"
+          - "CassandraTask"
+
+    - name: Pause for one minute to avoid 500 Internal Server Error ("no endpoints available for service")
+      ansible.builtin.pause:
+        minutes: 1
+
+    - name: "Create CassandraDatacenter resource (name: dc1)"
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: cassandra.datastax.com/v1beta1
+          kind: CassandraDatacenter
+          metadata:
+            name: dc1
+            namespace: datastax
+          spec:
+            canaryUpgradeCount: 0
+            clusterName: development
+            config:
+              cassandra-yaml:
+                authenticator: PasswordAuthenticator
+                authorizer: CassandraAuthorizer
+                client_encryption_options:
+                  enabled: true
+                  keystore: /etc/encryption/node-keystore.jks
+                  keystore_password: dc1
+                  optional: true
+                num_tokens: 16
+                role_manager: CassandraRoleManager
+              jvm-server-options:
+                initial_heap_size: 1G
+                max_heap_size: 1G
+            managementApiAuth:
+              insecure: {}
+            podTemplateSpec:
+              spec:
+                containers:
+                  - name: cassandra
+                securityContext: {}
+            racks:
+              - name: rack1
+              - name: rack2
+              - name: rack3
+            resources:
+              limits:
+                memory: 16Gi
+              requests:
+                cpu: "2"
+                memory: 8Gi
+            serverType: dse
+            serverVersion: "{{ version_dse }}"
+            size: 3
+            storageConfig:
+              cassandraDataVolumeClaimSpec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 10Gi
+                storageClassName: ocs-external-storagecluster-ceph-rbd
+        state: present
+
+    - name: "Waiting for creation and readiness of custom resource (name: dc1)"
+      wait_for_namespaced_custom_resource:
+        custom_resource_name: "dc1"
+        group: "cassandra.datastax.com"
+        jmespath_expression: "object.status.cassandraOperatorProgress == 'Ready'"
+        kind: "CassandraDatacenter"
+        plural: "cassandradatacenters"
+        project: "datastax"
+        version: "v1beta1"
+
+    - name: "Create Service resource (name: development-dc1-node-port-service)"
+      kubernetes.core.k8s:
+        resource_definition:
+          kind: Service
+          apiVersion: v1
+          metadata:
+            name: development-dc1-node-port-service
+            namespace: datastax
+          spec:
+            ports:
+              - name: native
+                protocol: TCP
+                port: 9042
+                targetPort: 9042
+                nodePort: 30000
+            type: NodePort
+            selector:
+              cassandra.datastax.com/cluster: development
+              cassandra.datastax.com/datacenter: dc1
+        state: present
+
+    - name: "Get secret (name: development-superuser)"
+      kubernetes.core.k8s_info:
+        kind: Secret
+        name: development-superuser
+        namespace: datastax
+      register: k8s_info_result
+
+    - set_fact:
+        password: "{{ k8s_info_result | json_query('resources[0].data.password') | b64decode }}"
+        username: "{{ k8s_info_result | json_query('resources[0].data.username') | b64decode }}"
+
+    - set_fact:
+        pod_name: datastax-config
+
+    - name: "Create Pod resource (name: {{ pod_name }})"
+      kubernetes.core.k8s:
+        resource_definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ pod_name }}"
+            namespace: datastax
+          spec:
+            containers:
+              - command:
+                  - sleep
+                  - infinity
+                image: redhat/ubi9
+                name: "{{ pod_name }}"
+
+    - name: "Waiting for creation and readiness of pod (name: {{ pod_name }})"
+      wait_for_namespaced_pod:
+        custom_resource_name: "{{ pod_name }}"
+        jmespath_expression: "raw_object.status.phase == 'Running'"
+        project: "datastax"
+
+    # workaround for the following error:
+    # error: unpacking of archive failed on file /usr/libexec/gstreamer-1.0/gst-ptp-helper;6878b7d1: cpio: cap_set_file failed - Operation not permitted
+    # error: gstreamer1-1.22.12-3.el9.x86_64: install failed
+    - name: "Configuring DNF"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- dnf config-manager --setopt tsflags=nocaps --save
+
+    - name: "Installing software packages"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- dnf install --assumeyes java-21-openjdk wget
+
+    - name: "Downloading cqlsh {{ version_dse }}"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- wget --directory-prefix /root https://downloads.datastax.com/enterprise/cqlsh-{{ version_dse }}-bin.tar.gz
+
+    - name: "Installing cqlsh {{ version_dse }}"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- tar --directory /root --extract --file /root/cqlsh-{{ version_dse }}-bin.tar.gz
+
+    - name: "Downloading dsbulk {{ version_dsbulk }}"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- wget --directory-prefix /root https://github.com/datastax/dsbulk/releases/download/{{ version_dsbulk }}/dsbulk-{{ version_dsbulk }}.tar.gz
+
+    - name: "Installing dsbulk {{ version_dsbulk }}"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- tar --directory /root --extract --file /root/dsbulk-{{ version_dsbulk }}.tar.gz
+
+    - name: "DataStax Enterprise: Creating keyspace 'qna_ks'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE KEYSPACE IF NOT EXISTS qna_ks
+          WITH REPLICATION = {
+            \'class\' : \'SimpleStrategy\',
+            \'replication_factor\' : 1
+          };'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Creating role 'ibm_techxchange_2025'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE ROLE IF NOT EXISTS ibm_techxchange_2025 WITH LOGIN = true AND PASSWORD = \'ibm_techxchange_2025\';'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Granting privileges on keyspace 'qna_ks' to role 'ibm_techxchange_2025'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          GRANT CREATE, SELECT, TRUNCATE, UPDATE ON KEYSPACE qna_ks TO ibm_techxchange_2025;'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Creating table 'example_log_index' in keyspace 'qna_ks'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE TABLE IF NOT EXISTS qna_ks.example_log_index (
+            id TEXT PRIMARY KEY,
+            question TEXT,
+            response TEXT,
+            source_documents TEXT,
+            hallucination_detection TEXT,
+            log_timestamp TIMESTAMP,
+            feedback TEXT,
+            expert_details TEXT,
+            elapsed_times TEXT,
+            vector VECTOR <FLOAT,768>
+          );'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Granting privileges on table 'example_log_index' in keyspace 'qna_ks' to role 'ibm_techxchange_2025'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          GRANT SELECT ON TABLE qna_ks.example_log_index TO ibm_techxchange_2025;'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "Downloading 'example_log_index.json'"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- wget --directory-prefix /root https://ibm-techxchange-2025.s3.us-east-2.amazonaws.com/example_log_index.json
+
+    - name: "DataStax Enterprise: Loading 'example_log_index.json'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          /root/dsbulk-{{ version_dsbulk }}/bin/dsbulk
+          load
+          -c json
+          -h development-dc1-service.datastax.svc.cluster.local
+          -k qna_ks
+          -p {{ password }}
+          -query 'INSERT INTO example_log_index (id, elapsed_times, expert_details, feedback, hallucination_detection, log_timestamp, question, response, source_documents, \\\"vector\\\") VALUES (:id, :elapsed_times, :expert_details, :feedback, :hallucination_detection, :log_timestamp, :question, :response, :source_documents, :\\\"vector\\\")'
+          -u {{ username }}
+          -url /root/example_log_index.json"
+
+    - name: "DataStax Enterprise: Creating keyspace 'amazon_products_hugging_face'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE KEYSPACE IF NOT EXISTS amazon_products_hugging_face
+          WITH REPLICATION = {
+            \'class\' : \'SimpleStrategy\',
+            \'replication_factor\' : 1
+          };'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Creating table 'amazon_products_hugging_face' in keyspace 'amazon_products_hugging_face'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE TABLE IF NOT EXISTS amazon_products_hugging_face.amazon_products_hugging_face (
+            product_id INT,
+            product_name TEXT,
+            category TEXT,
+            description TEXT,
+            text_vector VECTOR <FLOAT, 768>,
+            image BLOB,
+            image_vector VECTOR <FLOAT, 768>,
+            PRIMARY KEY (product_id)
+          );'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Granting privileges on table 'amazon_products_hugging_face' in keyspace 'amazon_products_hugging_face' to role 'ibm_techxchange_2025'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          GRANT SELECT ON TABLE amazon_products_hugging_face.amazon_products_hugging_face TO ibm_techxchange_2025;'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "Downloading 'amazon_products_hugging_face.json'"
+      ansible.builtin.command:
+        cmd: oc exec --namespace datastax {{ pod_name }} -- wget --directory-prefix /root https://ibm-techxchange-2025.s3.us-east-2.amazonaws.com/amazon_products_hugging_face.json
+
+    - name: "DataStax Enterprise: Loading 'amazon_products_hugging_face.json'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          /root/dsbulk-{{ version_dsbulk }}/bin/dsbulk
+          load
+          -c json
+          -h development-dc1-service.datastax.svc.cluster.local
+          -k amazon_products_hugging_face
+          -p {{ password }}
+          -t amazon_products_hugging_face
+          -u {{ username }}
+          -url /root/amazon_products_hugging_face.json"
+
+    - name: "DataStax Enterprise: Creating custom index on table 'amazon_products_hugging_face(image_vector)'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE CUSTOM INDEX IF NOT EXISTS amazon_products_hugging_face_image_vector_idx ON amazon_products_hugging_face.amazon_products_hugging_face(image_vector)
+          USING \'StorageAttachedIndex\';'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "DataStax Enterprise: Creating custom index on table 'amazon_products_hugging_face(text_vector)'"
+      ansible.builtin.command:
+        cmd: >-
+          oc exec --namespace datastax {{ pod_name }} -- bash -c "
+          SSL_VALIDATE=false /root/cqlsh-{{ version_dse }}/bin/cqlsh development-dc1-service.datastax.svc.cluster.local
+          --execute $'
+          CREATE CUSTOM INDEX IF NOT EXISTS amazon_products_hugging_face_text_vector_idx ON amazon_products_hugging_face.amazon_products_hugging_face(text_vector)
+          USING \'StorageAttachedIndex\';'
+          --password {{ password }}
+          --ssl
+          --username {{ username }}"
+
+    - name: "Delete Pod resource (name: {{ pod_name }})"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        name: "{{ pod_name }}"
+        namespace: datastax
+        state: absent
